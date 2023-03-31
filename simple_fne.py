@@ -14,6 +14,8 @@ import threading
 ##import traceback # debugging only
 import time
 
+VERSION = 0x0101
+
 COMMANDS = ["RPTACK", "RPTCL", "RPTL", "RPTK", "RPTO", "RPTC", "RPTPING",
             "RPTSL", "DMRD", "P25D", "TRNSDIAG", "TRNSLOG"]
 
@@ -23,7 +25,8 @@ DEFAULT_CONFIG = {
 "FNE": {
  "ip":"ANY",
  "port":"54000",
- "endpoint_timeout":120
+ "endpoint_timeout":120,
+ "show_pings":"true"
  }
 }
 
@@ -54,6 +57,7 @@ class FNE(object):
         port = cp.getint("FNE", "port", fallback=54000)
         self.endpoint_timeout = cp.getint("FNE", "endpoint_timeout",
                                           fallback=120)
+        self.show_pings = cp.getboolean("FNE", "show_pings", fallback=True)
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.s.settimeout(1) # permit a slow tick for KeyboardInterrupt catch
         print("Listening on {}:{}".format(ip, port))
@@ -88,7 +92,10 @@ class FNE(object):
         self.endpoint_flag.wait()
         self.endpoint_flag.clear()
         for target in self.endpoints:
-            p = struct.pack(">I", self.endpoints[target].peer_id)[0]
+            if self.endpoints[target].peer_id != None:
+                p = struct.pack(">I", self.endpoints[target].peer_id)
+            else:
+                p = b"\x00\x00\x00\x00" # don't pack None
 ##            self._send_cmd(b"MSTCL"+p, target)
             self.endpoints[target].q.put(b"MSTCL"+p)
         if self.endpoints: time.sleep(1.1) # wait for timeouts to expire
@@ -101,10 +108,13 @@ class FNE(object):
             time.sleep(0.1)
         if self.endpoints:
             print("Couldn't close certain endpoints. Killing them!")
+            time.sleep(0.01)
             kl = tuple(self.endpoints.keys())
             for k in kl:
-                del self.endpoints[kl].t
-                del self.endpoints[kl]
+                try: 
+                    del self.endpoints[kl].t
+                    del self.endpoints[kl]
+                except KeyError: pass # possible race condition?
         print("Exited simpleFNE")
 
     def register_endpoint(self, target):
@@ -138,6 +148,18 @@ class FNE(object):
         lep = len(self.endpoints)
         self.endpoint_flag.set()
         return (lep, len(prune))
+
+    def update_peer_id(self, target, peer_id):
+        """Update the peer ID of an endpoint"""
+        self.endpoint_flag.wait()
+        self.endpoint_flag.clear()
+        if target in self.endpoints:
+            if self.endpoints[target].peer_id != None and \
+               self.endpoints[target].peer_id != peer_id:
+                print("Peer ID of", target, "changed from",
+                      self.endpoints[target].peer_id, "to", peer_id)
+            self.endpoints[target].peer_id = peer_id
+        self.endpoint_flag.set()
 
     def send_cmd(self, target, msg):
         """Send a command to a (hopefully) registered endpoint"""
@@ -186,18 +208,6 @@ class FNE(object):
             print("Unrecognized command", msgs)
 ##        print()
 
-    def update_peer_id(self, target, peer_id):
-        """Update the peer ID of an endpoint"""
-        self.endpoint_flag.wait()
-        self.endpoint_flag.clear()
-        if target in self.endpoints:
-            if self.endpoints[target].peer_id != None and \
-               self.endpoints[target].peer_id != peer_id:
-                print("Peer ID of", target, "changed from",
-                      self.endpoints[target].peer_id, "to", peer_id)
-            self.endpoints[target].peer_id = peer_id
-        self.endpoint_flag.set()
-
     def cmd_RPTL(self, msg, addr):
         """Repeater login command -- repeater wants ACK with challenge salt"""
         print("Received login request from", form_int(msg[4:8]))
@@ -230,8 +240,9 @@ class FNE(object):
         """Pong a ping -- repeater wants MSTPONG with its ID"""
         # DVMFNE checks if an endpoint is auth'd, else it gets a NAK + ID
         # In simpleFNE, all endpoints are auth'd, so we don't even check
-        print("Got pinged by", form_int(msg[7:11]))
+        if self.show_pings: print("Got pinged by", form_int(msg[7:11]))
         self.send_cmd(addr, b"MSTPONG"+msg[7:11])
+        self.update_peer_id(addr, form_int(msg[7:11]))
 
     def cmd_TRNSDIAG(self, msg, addr):
         """Transfer diagnostics log -- nothing expected in return"""
@@ -312,7 +323,8 @@ class FNEEndpoint(object):
         self.safe = True
 
 def main():
-    ap = argparse.ArgumentParser(description="SimpleFNE by CVSoft")
+    ap = argparse.ArgumentParser(description="SimpleFNE by CVSoft v{:x}.{:02x}"\
+                                 .format(VERSION >> 8, VERSION & 0xFF))
     ap.add_argument("fn", nargs="?", default=None)
     a = ap.parse_args()
     f = FNE(cfg_fn=a.fn)
